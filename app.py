@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from html import escape
 import re
 import sqlite3
 from pathlib import Path
@@ -18,6 +19,14 @@ DEFAULT_BANK_KEY = "boi_od"
 DEFAULT_TALLY_PORT = 9000
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bank_memory.db"
+BANK_OPTIONS = {
+    "Bank of India (BOI)": "boi_od",
+    "Punjab National Bank (PNB)": "pnb",
+}
+PNB_NET_BANKING_URL = (
+    "https://icorp.pnb.bank.in/corp/AuthenticationController?FORMSGROUP_ID__=AuthenticationFG&__START_TRAN_FLAG__=Y&__FG_BUTTONS__=LOAD&ACTION.LOAD=Y&AuthenticationFG.LOGIN_FLAG=1&BANK_ID=024"
+)
+BOI_NET_BANKING_URL = "https://starconnectcbs.bankofindia.com/BankOfIndia/"
 
 
 def init_database(db_path: Path = DB_PATH) -> None:
@@ -86,8 +95,10 @@ def init_session_state() -> None:
     st.session_state.setdefault("tally_error", "")
     st.session_state.setdefault("primary_bank_ledger", "")
     st.session_state.setdefault("uploaded_file_hash", "")
+    st.session_state.setdefault("uploaded_bank_key", DEFAULT_BANK_KEY)
     st.session_state.setdefault("parsed_statement", None)
     st.session_state.setdefault("review_df", None)
+    st.session_state.setdefault("preview_vouchers", [])
     st.session_state.setdefault("sync_results", [])
 
 
@@ -176,10 +187,10 @@ def apply_auto_tagging(
     return review_df
 
 
-def parse_uploaded_file(file_bytes: bytes) -> ParsedStatement:
+def parse_uploaded_file(file_bytes: bytes, bank_key: str) -> ParsedStatement:
     """Parse the uploaded statement using the configured bank parser."""
 
-    return parse_statement(pdf_bytes=file_bytes, bank_key=DEFAULT_BANK_KEY)
+    return parse_statement(pdf_bytes=file_bytes, bank_key=bank_key)
 
 
 def refresh_ledgers_from_tally(port: int) -> None:
@@ -232,6 +243,114 @@ def build_voucher_payload(row: pd.Series, primary_bank_ledger: str) -> dict[str,
     }
 
 
+def format_preview_date(value: object) -> str:
+    """Format dates like Tally's classic voucher screen."""
+
+    return pd.to_datetime(value).strftime("%d-%b-%Y").upper()
+
+
+def build_voucher_preview_html(
+    voucher_payload: dict[str, str | float], voucher_number: int
+) -> str:
+    """Build a Tally-style voucher preview card using scoped inline HTML/CSS."""
+
+    voucher_type = escape(str(voucher_payload["voucher_type"]))
+    debit_ledger = escape(str(voucher_payload["debit_ledger"]))
+    credit_ledger = escape(str(voucher_payload["credit_ledger"]))
+    narration = escape(str(voucher_payload["narration"]))
+    amount = f"{float(voucher_payload['amount']):,.2f}"
+    preview_date = escape(format_preview_date(voucher_payload["date"]))
+
+    return f"""
+    <div style="
+        background:#FDF6E3;
+        border:2px solid #2C8C99;
+        border-radius:8px;
+        box-shadow:0 6px 18px rgba(44, 140, 153, 0.18);
+        overflow:hidden;
+        margin:14px 0;
+        font-family:'Courier New', 'Liberation Mono', monospace;
+        color:#1F2933;
+    ">
+        <div style="
+            background:#2C8C99;
+            color:#FFFFFF;
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            padding:12px 16px;
+            font-size:18px;
+            font-weight:700;
+            letter-spacing:0.2px;
+        ">
+            <span>Accounting Voucher Creation</span>
+            <span style="font-size:15px;">Date : {preview_date}</span>
+        </div>
+        <div style="
+            background:#4B8BBE;
+            color:#FFFFFF;
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            padding:9px 16px;
+            font-size:15px;
+            font-weight:700;
+        ">
+            <span>Voucher Type : {voucher_type}</span>
+            <span>Preview #{voucher_number}</span>
+        </div>
+        <div style="padding:18px 20px 12px 20px;">
+            <div style="
+                display:grid;
+                grid-template-columns:1fr 180px;
+                gap:12px;
+                padding:10px 0;
+                border-bottom:1px dashed #B5B5A3;
+                font-size:16px;
+            ">
+                <div>Dr&nbsp;&nbsp;{debit_ledger}</div>
+                <div style="text-align:right; font-weight:700;">{amount}</div>
+            </div>
+            <div style="
+                display:grid;
+                grid-template-columns:1fr 180px;
+                gap:12px;
+                padding:10px 0;
+                border-bottom:1px dashed #B5B5A3;
+                font-size:16px;
+            ">
+                <div>Cr&nbsp;&nbsp;{credit_ledger}</div>
+                <div style="text-align:right; font-weight:700;">{amount}</div>
+            </div>
+        </div>
+        <div style="
+            padding:14px 20px 18px 20px;
+            background:#FFFBEA;
+            border-top:1px solid #E6DFC2;
+            font-size:15px;
+            line-height:1.5;
+        ">
+            <span style="font-weight:700; color:#2C8C99;">Narration:</span>
+            <span>{narration}</span>
+        </div>
+    </div>
+    """
+
+
+def render_voucher_previews(preview_vouchers: list[dict[str, str | float]]) -> None:
+    """Render all prepared voucher previews using Tally-style HTML blocks."""
+
+    if not preview_vouchers:
+        return
+
+    st.subheader("Tally Voucher Preview")
+    for index, voucher_payload in enumerate(preview_vouchers, start=1):
+        st.markdown(
+            build_voucher_preview_html(voucher_payload, voucher_number=index),
+            unsafe_allow_html=True,
+        )
+
+
 def persist_approved_mappings(review_df: pd.DataFrame) -> int:
     """Save approved row mappings to SQLite using the first three description words."""
 
@@ -255,6 +374,10 @@ def persist_approved_mappings(review_df: pd.DataFrame) -> int:
 def render_sidebar() -> str:
     """Render Tally settings and return the selected primary bank ledger."""
 
+    st.sidebar.markdown("**Bank Quick Links**")
+    st.sidebar.link_button("PNB Net Banking", PNB_NET_BANKING_URL, use_container_width=True)
+    st.sidebar.link_button("BOI Net Banking", BOI_NET_BANKING_URL, use_container_width=True)
+    st.sidebar.divider()
     st.sidebar.header("Tally Settings")
     tally_port = st.sidebar.number_input(
         "Tally Port",
@@ -376,11 +499,28 @@ def main() -> None:
     init_session_state()
     primary_bank_ledger = render_sidebar()
 
+    selected_bank_label = st.selectbox(
+        "Select Statement Format",
+        options=list(BANK_OPTIONS.keys()),
+        index=list(BANK_OPTIONS.keys()).index(
+            next(
+                (
+                    label
+                    for label, bank_key in BANK_OPTIONS.items()
+                    if bank_key == st.session_state.get("uploaded_bank_key", DEFAULT_BANK_KEY)
+                ),
+                "Bank of India (BOI)",
+            )
+        ),
+        help="Choose the bank format so the correct PDF extraction logic is used.",
+    )
+    selected_bank_key = BANK_OPTIONS[selected_bank_label]
+
     uploaded_file = st.file_uploader(
         "Upload Bank Statement PDF",
         type=["pdf"],
         accept_multiple_files=False,
-        help="Currently configured for Bank of India overdraft statements.",
+        help="Supported formats: Bank of India (BOI) and Punjab National Bank (PNB).",
     )
 
     if uploaded_file is not None:
@@ -391,28 +531,37 @@ def main() -> None:
             st.error(f"Unable to read the uploaded file: {exc}")
             return
 
-        if file_hash != st.session_state["uploaded_file_hash"]:
+        should_reparse = (
+            file_hash != st.session_state["uploaded_file_hash"]
+            or selected_bank_key != st.session_state["uploaded_bank_key"]
+        )
+
+        if should_reparse:
             try:
-                parsed_statement = parse_uploaded_file(file_bytes)
+                parsed_statement = parse_uploaded_file(file_bytes, bank_key=selected_bank_key)
                 mappings = load_saved_mappings()
                 review_df = apply_auto_tagging(parsed_statement.dataframe, mappings)
             except Exception as exc:
                 st.session_state["uploaded_file_hash"] = ""
+                st.session_state["uploaded_bank_key"] = selected_bank_key
                 st.session_state["parsed_statement"] = None
                 st.session_state["review_df"] = None
+                st.session_state["preview_vouchers"] = []
                 st.error(f"Unable to parse the uploaded PDF: {exc}")
                 return
 
             st.session_state["uploaded_file_hash"] = file_hash
+            st.session_state["uploaded_bank_key"] = selected_bank_key
             st.session_state["parsed_statement"] = parsed_statement
             st.session_state["review_df"] = review_df
+            st.session_state["preview_vouchers"] = []
             st.session_state["sync_results"] = []
 
     review_df = st.session_state.get("review_df")
     parsed_statement = st.session_state.get("parsed_statement")
 
     if review_df is None or parsed_statement is None:
-        st.info("Upload a BOI overdraft statement PDF to begin.")
+        st.info("Select a statement format and upload a BOI or PNB statement PDF to begin.")
         return
 
     st.success(
@@ -429,6 +578,37 @@ def main() -> None:
 
     edited_df = render_data_editor(review_df, st.session_state["tally_ledgers"])
     st.session_state["review_df"] = edited_df
+
+    if st.button("Preview Approved Vouchers", use_container_width=True):
+        approved_rows = edited_df[edited_df["Approve"] == True]
+
+        if approved_rows.empty:
+            st.session_state["preview_vouchers"] = []
+            st.info("No approved rows were selected for preview.")
+        elif not primary_bank_ledger:
+            st.session_state["preview_vouchers"] = []
+            st.error("Select the Primary Bank Ledger before previewing vouchers.")
+        else:
+            preview_vouchers: list[dict[str, str | float]] = []
+
+            for _, row in approved_rows.iterrows():
+                suggested_ledger = str(row["Suggested Ledger"]).strip()
+                if not suggested_ledger:
+                    continue
+
+                preview_vouchers.append(
+                    build_voucher_payload(
+                        row=row,
+                        primary_bank_ledger=primary_bank_ledger,
+                    )
+                )
+
+            st.session_state["preview_vouchers"] = preview_vouchers
+
+            if not preview_vouchers:
+                st.info("Approved rows need a Suggested Ledger before they can be previewed.")
+
+    render_voucher_previews(st.session_state["preview_vouchers"])
 
     action_col_1, action_col_2 = st.columns(2)
 
